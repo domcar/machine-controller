@@ -5,6 +5,8 @@ ssh_pwauth: no
 
 ssh_authorized_keys:
 - "ssh-rsa AAABBB"
+- "ssh-rsa CCCDDD"
+- "ssh-rsa EEEFFF"
 
 write_files:
 - path: "/etc/systemd/journald.conf.d/max_disk_use.conf"
@@ -137,8 +139,6 @@ write_files:
         --cni-conf-dir=/etc/cni/net.d \
         --hostname-override=node1 \
         --network-plugin=cni \
-        --cloud-provider=openstack \
-        --cloud-config=/etc/kubernetes/cloud-config \
         --cert-dir=/etc/kubernetes/ \
         --pod-manifest-path=/etc/kubernetes/manifests \
         --kubeconfig=/etc/kubernetes/kubeconfig \
@@ -146,11 +146,6 @@ write_files:
     
 
 
-- path: "/etc/kubernetes/cloud-config"
-  content: |
-    custom
-    cloud
-    config
 
 - path: "/etc/kubernetes/bootstrap.kubeconfig"
   content: |

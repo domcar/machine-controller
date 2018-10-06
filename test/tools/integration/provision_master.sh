@@ -48,7 +48,7 @@ if ! which kubelet; then
   deb http://apt.kubernetes.io/ kubernetes-xenial main
 EOF
   apt-get update
-  apt-get install -y kubelet=1.12.0-00 kubeadm=1.12.0-00 kubectl=1.12.0-00
+  apt-get install -y kubelet=1.12.1-02 kubeadm=1.12.1-02 kubectl=1.12.1-02
   kubeadm init --kubernetes-version=v1.12.0 --apiserver-advertise-address=$ADDR --pod-network-cidr=10.244.0.0/16
   sed -i 's/\(.*leader-elect=true\)/\1\n    - --feature-gates=ScheduleDaemonSetPods=false/g' /etc/kubernetes/manifests/kube-scheduler.yaml
   sed -i 's/\(.*leader-elect=true\)/\1\n    - --feature-gates=ScheduleDaemonSetPods=false/g' /etc/kubernetes/manifests/kube-controller-manager.yaml

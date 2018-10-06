@@ -80,7 +80,7 @@ write_files:
     
     # crictl
     if [ ! -f /opt/bin/crictl ]; then
-        wget -O /opt/crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.11.1/crictl-v1.11.1-linux-amd64.tar.gz
+        wget -O /opt/crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.0.0-beta.1/crictl-v1.0.0-beta.1-linux-amd64.tar.gz
         tar -xvf /opt/crictl.tar.gz -C /opt/bin/
     fi
     
@@ -105,7 +105,7 @@ write_files:
     
     # kubelet
     if [ ! -f /opt/bin/kubelet ]; then
-        wget -O /opt/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/v1.11.3/bin/linux/amd64/kubelet
+        wget -O /opt/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/v1.10.10/bin/linux/amd64/kubelet
         chmod +x /opt/bin/kubelet
     fi
     
@@ -137,8 +137,6 @@ write_files:
         --cni-conf-dir=/etc/cni/net.d \
         --hostname-override=node1 \
         --network-plugin=cni \
-        --cloud-provider=openstack \
-        --cloud-config=/etc/kubernetes/cloud-config \
         --cert-dir=/etc/kubernetes/ \
         --pod-manifest-path=/etc/kubernetes/manifests \
         --kubeconfig=/etc/kubernetes/kubeconfig \
@@ -146,11 +144,6 @@ write_files:
     
 
 
-- path: "/etc/kubernetes/cloud-config"
-  content: |
-    custom
-    cloud
-    config
 
 - path: "/etc/kubernetes/bootstrap.kubeconfig"
   content: |
@@ -203,6 +196,9 @@ write_files:
   permissions: "0644"
   content: |
     [plugins]
+      [plugins.cri]
+        # see release notes: https://github.com/containerd/containerd/releases/tag/v1.2.0-rc.1
+        stream_server_address = ""
     
 
 - path: "/etc/systemd/system/containerd.service"

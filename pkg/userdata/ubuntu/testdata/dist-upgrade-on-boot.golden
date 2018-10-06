@@ -36,6 +36,7 @@ write_files:
     # Make sure we always disable swap - Otherwise the kubelet won't start'.
     systemctl mask swap.target
     swapoff -a
+    DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" dist-upgrade -y
     if [[ -e /var/run/reboot-required ]]; then
       reboot
     fi
@@ -137,8 +138,6 @@ write_files:
         --cni-conf-dir=/etc/cni/net.d \
         --hostname-override=node1 \
         --network-plugin=cni \
-        --cloud-provider=openstack \
-        --cloud-config=/etc/kubernetes/cloud-config \
         --cert-dir=/etc/kubernetes/ \
         --pod-manifest-path=/etc/kubernetes/manifests \
         --kubeconfig=/etc/kubernetes/kubeconfig \
@@ -146,11 +145,6 @@ write_files:
     
 
 
-- path: "/etc/kubernetes/cloud-config"
-  content: |
-    custom
-    cloud
-    config
 
 - path: "/etc/kubernetes/bootstrap.kubeconfig"
   content: |

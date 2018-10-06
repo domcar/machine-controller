@@ -148,9 +148,7 @@ write_files:
 
 - path: "/etc/kubernetes/cloud-config"
   content: |
-    custom
-    cloud
-    config
+    {openstack-config:true}
 
 - path: "/etc/kubernetes/bootstrap.kubeconfig"
   content: |
@@ -253,6 +251,8 @@ write_files:
     cgroupsPerQOS: true
     clusterDNS:
     - 10.10.10.10
+    - 10.10.10.11
+    - 10.10.10.12
     clusterDomain: cluster.local
     containerLogMaxFiles: 5
     containerLogMaxSize: 10Mi

@@ -16,16 +16,7 @@ write_files:
     kernel.panic_on_oops = 1
     kernel.panic = 10
     vm.overcommit_memory = 1
-
-- path: "/etc/yum.repos.d/kubernetes.repo"
-  content: |
-    [kubernetes]
-    name=Kubernetes
-    baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-$basearch
-    enabled=1
-    gpgcheck=1
-    repo_gpgcheck=1
-    gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+    net.ipv4.ip_forward = 1
 
 - path: /etc/sysconfig/selinux
   content: |
@@ -41,56 +32,30 @@ write_files:
     #     mls - Multi Level Security protection.
     SELINUXTYPE=targeted
 
-- path: "/etc/sysconfig/kubelet-overwrite"
-  content: |
-    KUBELET_DNS_ARGS=
-    KUBELET_EXTRA_ARGS=--authentication-token-webhook=true \
-      --cloud-provider=aws \
-      --cloud-config=/etc/kubernetes/cloud-config \
-      --hostname-override=node1 \
-      --read-only-port=0 \
-      --protect-kernel-defaults=true \
-      --cluster-dns= \
-      --cluster-domain=cluster.local
-- path: "/etc/systemd/system/kubelet.service.d/20-extra.conf"
-  content: |
-    [Service]
-    EnvironmentFile=/etc/sysconfig/kubelet
-
-- path: "/etc/kubernetes/cloud-config"
-  content: |
-    {aws-config:true}
-
-- path: "/usr/local/bin/setup"
+- path: "/opt/bin/setup"
   permissions: "0777"
   content: |
     #!/bin/bash
     set -xeuo pipefail
+
     setenforce 0 || true
     sysctl --system
 
-    yum install -y docker-1.13.1 \
-      kubelet-1.10.2 \
-      kubeadm-1.10.2 \
-      ebtables \
+    yum install -y ebtables \
       ethtool \
       nfs-utils \
       bash-completion \
-      sudo
+      sudo \
+      wget
 
-    cp /etc/sysconfig/kubelet-overwrite /etc/sysconfig/kubelet
+    # Download all required binaries
+    /opt/bin/download_binaries
 
-    systemctl enable --now docker
+    systemctl enable --now containerd
     systemctl enable --now kubelet
 
-    kubeadm join \
-      --token my-token \
-      --discovery-token-ca-cert-hash sha256:6caecce9fedcb55d4953d61a27dc6997361a2f226ad86d7e6004dde7526fc4b1 \
-      --ignore-preflight-errors=CRI \
-      server:443
-
-- path: "/usr/local/bin/supervise.sh"
-  permissions: "0777"
+- path: "/opt/bin/supervise.sh"
+  permissions: "0755"
   content: |
     #!/bin/bash
     set -xeuo pipefail
@@ -98,7 +63,245 @@ write_files:
       sleep 1
     done
 
+- path: "/opt/bin/download_binaries"
+  permissions: "0755"
+  content: |
+    #!/bin/bash
+    set -xeuo pipefail
+    
+    mkdir -p /opt/bin/
+    
+    # crictl
+    if [ ! -f /opt/bin/crictl ]; then
+        wget -O /opt/crictl.tar.gz https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.0.0-beta.1/crictl-v1.0.0-beta.1-linux-amd64.tar.gz
+        tar -xvf /opt/crictl.tar.gz -C /opt/bin/
+    fi
+    
+    # cni
+    if [ ! -f /opt/cni/bin/loopback ]; then
+        wget -O /opt/cni-plugins.tar.gz https://github.com/containernetworking/plugins/releases/download/v0.6.0/cni-plugins-amd64-v0.6.0.tgz
+        mkdir -p /opt/cni/bin /etc/cni/net.d
+        tar -xvf /opt/cni-plugins.tar.gz -C /opt/cni/bin/
+    fi
+    
+    # runc
+    if [ ! -f /opt/bin/runc ]; then
+        wget -O /opt/bin/runc https://github.com/opencontainers/runc/releases/download/v1.0.0-rc5/runc.amd64        
+        chmod +x /opt/bin/runc
+    fi
+    
+    # containerd
+    if [ ! -f /opt/bin/containerd ]; then
+        wget -O /opt/containerd.tar.gz https://github.com/containerd/containerd/releases/download/v1.2.0-rc.1/containerd-1.2.0-rc.1.linux-amd64.tar.gz
+        sudo tar -xvf /opt/containerd.tar.gz -C /opt/
+    fi
+    
+    # kubelet
+    if [ ! -f /opt/bin/kubelet ]; then
+        wget -O /opt/bin/kubelet https://storage.googleapis.com/kubernetes-release/release/v1.10.2/bin/linux/amd64/kubelet
+        chmod +x /opt/bin/kubelet
+    fi
+    
+
+- path: "/etc/systemd/system/kubelet.service"
+  content: |
+    [Unit]
+    After=containerd.service
+    Requires=containerd.service
+    
+    [Install]
+    WantedBy=multi-user.target
+    
+    [Service]
+    Restart=on-failure
+    RestartSec=5
+    Environment="PATH=/opt/bin:/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin/"
+    ExecStartPre=/sbin/modprobe br_netfilter
+    ExecStartPre=/bin/mkdir -p /etc/kubernetes/manifests
+    ExecStart=/opt/bin/kubelet \
+        --config=/var/lib/kubelet/config.yaml \
+        --container-runtime=remote \
+        --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
+        --runtime-cgroups=/system.slice/containerd.service \
+        --runtime-request-timeout=15m \
+        --cadvisor-port=0 \
+        --allow-privileged=true \
+        --cni-bin-dir=/opt/cni/bin \
+        --cni-conf-dir=/etc/cni/net.d \
+        --hostname-override=node1 \
+        --network-plugin=cni \
+        --cloud-provider=aws \
+        --cloud-config=/etc/kubernetes/cloud-config \
+        --cert-dir=/etc/kubernetes/ \
+        --pod-manifest-path=/etc/kubernetes/manifests \
+        --kubeconfig=/etc/kubernetes/kubeconfig \
+        --bootstrap-kubeconfig=/etc/kubernetes/bootstrap.kubeconfig
+    
+
+
+- path: "/etc/kubernetes/cloud-config"
+  content: |
+    {aws-config:true}
+
+- path: "/etc/kubernetes/bootstrap.kubeconfig"
+  content: |
+    apiVersion: v1
+    clusters:
+    - cluster:
+        certificate-authority-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUVXakNDQTBLZ0F3SUJBZ0lKQUxmUmxXc0k4WVFITUEwR0NTcUdTSWIzRFFFQkJRVUFNSHN4Q3pBSkJnTlYKQkFZVEFsVlRNUXN3Q1FZRFZRUUlFd0pEUVRFV01CUUdBMVVFQnhNTlUyRnVJRVp5WVc1amFYTmpiekVVTUJJRwpBMVVFQ2hNTFFuSmhaR1pwZEhwcGJtTXhFakFRQmdOVkJBTVRDV3h2WTJGc2FHOXpkREVkTUJzR0NTcUdTSWIzCkRRRUpBUllPWW5KaFpFQmtZVzVuWVM1amIyMHdIaGNOTVRRd056RTFNakEwTmpBMVdoY05NVGN3TlRBME1qQTAKTmpBMVdqQjdNUXN3Q1FZRFZRUUdFd0pWVXpFTE1Ba0dBMVVFQ0JNQ1EwRXhGakFVQmdOVkJBY1REVk5oYmlCRwpjbUZ1WTJselkyOHhGREFTQmdOVkJBb1RDMEp5WVdSbWFYUjZhVzVqTVJJd0VBWURWUVFERXdsc2IyTmhiR2h2CmMzUXhIVEFiQmdrcWhraUc5dzBCQ1FFV0RtSnlZV1JBWkdGdVoyRXVZMjl0TUlJQklqQU5CZ2txaGtpRzl3MEIKQVFFRkFBT0NBUThBTUlJQkNnS0NBUUVBdDVmQWpwNGZUY2VrV1VUZnpzcDBreWloMU9ZYnNHTDBLWDFlUmJTUwpSOE9kMCs5UTYySHlueStHRndNVGI0QS9LVThtc3NvSHZjY2VTQUFid2ZieEZLLytzNTFUb2JxVW5PUlpyT29UClpqa1V5Z2J5WERTSzk5WUJiY1IxUGlwOHZ3TVRtNFhLdUx0Q2lnZUJCZGpqQVFkZ1VPMjhMRU5HbHNNbm1lWWsKSmZPRFZHblZtcjVMdGI5QU5BOElLeVRmc25ISjRpT0NTL1BsUGJVajJxN1lub1ZMcG9zVUJNbGdVYi9DeWtYMwptT29MYjR5SkpReUEvaVNUNlp4aUlFajM2RDR5V1o1bGc3WUpsK1VpaUJRSEdDblBkR3lpcHFWMDZleDBoZVlXCmNhaVc4TFdaU1VROTNqUStXVkNIOGhUN0RRTzFkbXN2VW1YbHEvSmVBbHdRL1FJREFRQUJvNEhnTUlIZE1CMEcKQTFVZERnUVdCQlJjQVJPdGhTNFA0VTd2VGZqQnlDNTY5UjdFNkRDQnJRWURWUjBqQklHbE1JR2lnQlJjQVJPdApoUzRQNFU3dlRmakJ5QzU2OVI3RTZLRi9wSDB3ZXpFTE1Ba0dBMVVFQmhNQ1ZWTXhDekFKQmdOVkJBZ1RBa05CCk1SWXdGQVlEVlFRSEV3MVRZVzRnUm5KaGJtTnBjMk52TVJRd0VnWURWUVFLRXd0Q2NtRmtabWwwZW1sdVl6RVMKTUJBR0ExVUVBeE1KYkc5allXeG9iM04wTVIwd0d3WUpLb1pJaHZjTkFRa0JGZzVpY21Ga1FHUmhibWRoTG1OdgpiWUlKQUxmUmxXc0k4WVFITUF3R0ExVWRFd1FGTUFNQkFmOHdEUVlKS29aSWh2Y05BUUVGQlFBRGdnRUJBRzZoClU5ZjlzTkgwLzZvQmJHR3kyRVZVMFVnSVRVUUlyRldvOXJGa3JXNWsvWGtEalFtKzNsempUMGlHUjRJeEUvQW8KZVU2c1FodWE3d3JXZUZFbjQ3R0w5OGxuQ3NKZEQ3b1pOaEZtUTk1VGIvTG5EVWpzNVlqOWJyUDBOV3pYZllVNApVSzJabklOSlJjSnBCOGlSQ2FDeEU4RGRjVUYwWHFJRXE2cEEyNzJzbm9MbWlYTE12Tmwza1lFZG0ramU2dm9ECjU4U05WRVVzenR6UXlYbUpFaENwd1ZJMEE2UUNqelhqK3F2cG13M1paSGk4SndYZWk4WlpCTFRTRkJraThaN24Kc0g5QkJIMzgvU3pVbUFONFFIU1B5MWdqcW0wME9BRThOYVlEa2gvYnpFNGQ3bUxHR01XcC9XRTNLUFN1ODJIRgprUGU2WG9TYmlMbS9reGszMlQwPQotLS0tLUVORCBDRVJUSUZJQ0FURS0tLS0t
+        server: https://server:443
+      name: ""
+    contexts: []
+    current-context: ""
+    kind: Config
+    preferences: {}
+    users:
+    - name: ""
+      user:
+        token: my-token
+    
+
+- path: "/etc/kubernetes/pki/ca.crt"
+  content: |
+    -----BEGIN CERTIFICATE-----
+    MIIEWjCCA0KgAwIBAgIJALfRlWsI8YQHMA0GCSqGSIb3DQEBBQUAMHsxCzAJBgNV
+    BAYTAlVTMQswCQYDVQQIEwJDQTEWMBQGA1UEBxMNU2FuIEZyYW5jaXNjbzEUMBIG
+    A1UEChMLQnJhZGZpdHppbmMxEjAQBgNVBAMTCWxvY2FsaG9zdDEdMBsGCSqGSIb3
+    DQEJARYOYnJhZEBkYW5nYS5jb20wHhcNMTQwNzE1MjA0NjA1WhcNMTcwNTA0MjA0
+    NjA1WjB7MQswCQYDVQQGEwJVUzELMAkGA1UECBMCQ0ExFjAUBgNVBAcTDVNhbiBG
+    cmFuY2lzY28xFDASBgNVBAoTC0JyYWRmaXR6aW5jMRIwEAYDVQQDEwlsb2NhbGhv
+    c3QxHTAbBgkqhkiG9w0BCQEWDmJyYWRAZGFuZ2EuY29tMIIBIjANBgkqhkiG9w0B
+    AQEFAAOCAQ8AMIIBCgKCAQEAt5fAjp4fTcekWUTfzsp0kyih1OYbsGL0KX1eRbSS
+    R8Od0+9Q62Hyny+GFwMTb4A/KU8mssoHvcceSAAbwfbxFK/+s51TobqUnORZrOoT
+    ZjkUygbyXDSK99YBbcR1Pip8vwMTm4XKuLtCigeBBdjjAQdgUO28LENGlsMnmeYk
+    JfODVGnVmr5Ltb9ANA8IKyTfsnHJ4iOCS/PlPbUj2q7YnoVLposUBMlgUb/CykX3
+    mOoLb4yJJQyA/iST6ZxiIEj36D4yWZ5lg7YJl+UiiBQHGCnPdGyipqV06ex0heYW
+    caiW8LWZSUQ93jQ+WVCH8hT7DQO1dmsvUmXlq/JeAlwQ/QIDAQABo4HgMIHdMB0G
+    A1UdDgQWBBRcAROthS4P4U7vTfjByC569R7E6DCBrQYDVR0jBIGlMIGigBRcAROt
+    hS4P4U7vTfjByC569R7E6KF/pH0wezELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNB
+    MRYwFAYDVQQHEw1TYW4gRnJhbmNpc2NvMRQwEgYDVQQKEwtCcmFkZml0emluYzES
+    MBAGA1UEAxMJbG9jYWxob3N0MR0wGwYJKoZIhvcNAQkBFg5icmFkQGRhbmdhLmNv
+    bYIJALfRlWsI8YQHMAwGA1UdEwQFMAMBAf8wDQYJKoZIhvcNAQEFBQADggEBAG6h
+    U9f9sNH0/6oBbGGy2EVU0UgITUQIrFWo9rFkrW5k/XkDjQm+3lzjT0iGR4IxE/Ao
+    eU6sQhua7wrWeFEn47GL98lnCsJdD7oZNhFmQ95Tb/LnDUjs5Yj9brP0NWzXfYU4
+    UK2ZnINJRcJpB8iRCaCxE8DdcUF0XqIEq6pA272snoLmiXLMvNl3kYEdm+je6voD
+    58SNVEUsztzQyXmJEhCpwVI0A6QCjzXj+qvpmw3ZZHi8JwXei8ZZBLTSFBki8Z7n
+    sH9BBH38/SzUmAN4QHSPy1gjqm00OAE8NaYDkh/bzE4d7mLGGMWp/WE3KPSu82HF
+    kPe6XoSbiLm/kxk32T0=
+    -----END CERTIFICATE-----
+
+- path: "/etc/containerd/config.toml"
+  permissions: "0644"
+  content: |
+    [plugins]
+      [plugins.cri]
+        # see release notes: https://github.com/containerd/containerd/releases/tag/v1.2.0-rc.1
+        stream_server_address = ""
+    
+
+- path: "/etc/systemd/system/containerd.service"
+  permissions: "0644"
+  content: |
+    [Unit]
+    Description=containerd container runtime
+    Documentation=https://containerd.io
+    After=network.target
+    
+    [Service]
+    Environment="PATH=/opt/bin:/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin/"
+    ExecStartPre=/sbin/modprobe overlay
+    ExecStart=/opt/bin/containerd --config /etc/containerd/config.toml
+    Restart=always
+    RestartSec=5
+    Delegate=yes
+    KillMode=process
+    OOMScoreAdjust=-999
+    LimitNOFILE=1048576
+    # Having non-zero Limit*s causes performance problems due to accounting overhead
+    # in the kernel. We recommend using cgroups to do container-local accounting.
+    LimitNPROC=infinity
+    LimitCORE=infinity
+    
+    [Install]
+    WantedBy=multi-user.target
+    
+
+- path: "/var/lib/kubelet/config.yaml"
+  content: |
+    address: 0.0.0.0
+    apiVersion: kubelet.config.k8s.io/v1beta1
+    authentication:
+      anonymous:
+        enabled: false
+      webhook:
+        cacheTTL: 2m0s
+        enabled: true
+      x509:
+        clientCAFile: /etc/kubernetes/pki/ca.crt
+    authorization:
+      mode: Webhook
+      webhook:
+        cacheAuthorizedTTL: 5m0s
+        cacheUnauthorizedTTL: 30s
+    cgroupDriver: cgroupfs
+    cgroupsPerQOS: true
+    clusterDNS:
+    clusterDomain: cluster.local
+    containerLogMaxFiles: 5
+    containerLogMaxSize: 10Mi
+    contentType: application/vnd.kubernetes.protobuf
+    cpuCFSQuota: true
+    cpuManagerPolicy: none
+    cpuManagerReconcilePeriod: 10s
+    enableControllerAttachDetach: true
+    enableDebuggingHandlers: true
+    enforceNodeAllocatable:
+    - pods
+    eventBurst: 10
+    eventRecordQPS: 5
+    evictionHard:
+      imagefs.available: 15%
+      memory.available: 100Mi
+      nodefs.available: 10%
+      nodefs.inodesFree: 5%
+    evictionPressureTransitionPeriod: 5m0s
+    failSwapOn: true
+    fileCheckFrequency: 20s
+    hairpinMode: promiscuous-bridge
+    healthzBindAddress: 127.0.0.1
+    healthzPort: 10248
+    httpCheckFrequency: 20s
+    imageGCHighThresholdPercent: 85
+    imageGCLowThresholdPercent: 80
+    imageMinimumGCAge: 2m0s
+    iptablesDropBit: 15
+    iptablesMasqueradeBit: 14
+    kind: KubeletConfiguration
+    kubeAPIBurst: 10
+    kubeAPIQPS: 5
+    makeIPTablesUtilChains: true
+    maxOpenFiles: 1000000
+    maxPods: 110
+    nodeStatusUpdateFrequency: 10s
+    oomScoreAdj: -999
+    podPidsLimit: -1
+    port: 10250
+    protectKernelDefaults: true
+    readOnlyPort: 0
+    registryBurst: 10
+    registryPullQPS: 5
+    resolvConf: /etc/resolv.conf
+    rotateCertificates: true
+    runtimeRequestTimeout: 15m
+    serializeImagePulls: true
+    staticPodPath: /etc/kubernetes/manifests
+    streamingConnectionIdleTimeout: 4h0m0s
+    syncFrequency: 1m0s
+    volumeStatsAggPeriod: 1m0s
+    
+
 - path: "/etc/systemd/system/setup.service"
+  permissions: "0644"
   content: |
     [Install]
     WantedBy=multi-user.target
@@ -110,7 +313,17 @@ write_files:
     [Service]
     Type=oneshot
     RemainAfterExit=true
-    ExecStart=/usr/local/bin/supervise.sh /usr/local/bin/setup
+    ExecStart=/opt/bin/supervise.sh /opt/bin/setup
+
+- path: "/etc/crictl.yaml"
+  permissions: "0644"
+  content: |
+    runtime-endpoint: unix:///run/containerd/containerd.sock
+
+- path: "/etc/profile.d/opt-bin-path.sh"
+  permissions: "0755"
+  content: |
+    export PATH="/opt/bin:$PATH"
 
 runcmd:
 - systemctl enable --now setup.service

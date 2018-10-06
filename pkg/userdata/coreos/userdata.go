@@ -13,7 +13,6 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubermatic/machine-controller/pkg/providerconfig"
-	machinetemplate "github.com/kubermatic/machine-controller/pkg/template"
 	"github.com/kubermatic/machine-controller/pkg/userdata/cloud"
 	userdatahelper "github.com/kubermatic/machine-controller/pkg/userdata/helper"
 
@@ -48,7 +47,7 @@ func (p Provider) UserData(
 	clusterDNSIPs []net.IP,
 ) (string, error) {
 
-	tmpl, err := template.New("user-data").Funcs(machinetemplate.TxtFuncMap()).Parse(ctTemplate)
+	tmpl, err := template.New("user-data").Funcs(userdatahelper.TxtFuncMap()).Parse(ctTemplate)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse user-data template: %v", err)
 	}
@@ -137,8 +136,7 @@ func (p Provider) UserData(
 	return string(out), nil
 }
 
-const ctTemplate = `
-passwd:
+const ctTemplate = `passwd:
   users:
     - name: core
       ssh_authorized_keys:
@@ -172,22 +170,41 @@ systemd:
     - name: locksmithd.service
       mask: true
 {{ end }}
+
     - name: docker.service
+      mask: true
+
+    - name: download.service
       enabled: true
+      contents: |
+        [Install]
+        WantedBy=multi-user.target
+
+        [Unit]
+        Wants=network-online.target
+        After=network.target network-online.target
+
+        [Service]
+        Type=oneshot
+        ExecStart=/opt/bin/download_binaries
+
+    - name: containerd.service
+      enabled: true
+      dropins:
+      - name: 10-download.conf
+        contents: |
+          [Unit]
+          Requires=download.service
+          After=download.service
+      contents: |
+{{ containerdSystemdUnit .KubeletVersion | indent 8 }}
 
     - name: kubelet.service
       enabled: true
-      dropins:
-      - name: 40-docker.conf
-        contents: |
-          [Unit]
-          Requires=docker.service
-          After=docker.service
       contents: |
         [Unit]
-        Description=Kubernetes Kubelet
-        Requires=docker.service
-        After=docker.service
+        Requires=containerd.service
+        After=containerd.service
         [Service]
         TimeoutStartSec=5min
         Environment=KUBELET_IMAGE=docker://k8s.gcr.io/hyperkube-amd64:{{ .HyperkubeImageTag }}
@@ -197,12 +214,16 @@ systemd:
           --mount volume=resolv,target=/etc/resolv.conf \
           --volume cni-bin,kind=host,source=/opt/cni/bin \
           --mount volume=cni-bin,target=/opt/cni/bin \
+          --volume opt-bin,kind=host,source=/opt/bin \
+          --mount volume=opt-bin,target=/opt/bin \
           --volume cni-conf,kind=host,source=/etc/cni/net.d \
           --mount volume=cni-conf,target=/etc/cni/net.d \
           --volume etc-kubernetes,kind=host,source=/etc/kubernetes \
           --mount volume=etc-kubernetes,target=/etc/kubernetes \
           --volume var-log,kind=host,source=/var/log \
           --mount volume=var-log,target=/var/log \
+          --volume var-lib-containerd,kind=host,source=/var/lib/containerd \
+          --mount volume=var-lib-containerd,target=/var/lib/containerd \
           --volume var-lib-calico,kind=host,source=/var/lib/calico \
           --mount volume=var-lib-calico,target=/var/lib/calico"
         ExecStartPre=/bin/mkdir -p /var/lib/calico
@@ -211,13 +232,15 @@ systemd:
         ExecStartPre=/bin/mkdir -p /opt/cni/bin
         ExecStartPre=-/usr/bin/rkt rm --uuid-file=/var/cache/kubelet-pod.uuid
         ExecStart=/usr/lib/coreos/kubelet-wrapper \
-          --container-runtime=docker \
+          --config=/etc/kubernetes/config.yaml \
+          --container-runtime=remote \
+          --container-runtime-endpoint=unix:///run/containerd/containerd.sock \
+          --runtime-request-timeout=15m \
+          --runtime-cgroups=/system.slice/containerd.service \
+          --cadvisor-port=0 \
           --allow-privileged=true \
           --cni-bin-dir=/opt/cni/bin \
           --cni-conf-dir=/etc/cni/net.d \
-          --cluster-dns={{ ipSliceToCommaSeparatedString .ClusterDNSIPs }} \
-          --cluster-domain=cluster.local \
-          --authentication-token-webhook=true \
           --hostname-override={{ .MachineSpec.Name }} \
           --network-plugin=cni \
           {{- if .CloudProvider }}
@@ -226,17 +249,8 @@ systemd:
           {{- end }}
           --cert-dir=/etc/kubernetes/ \
           --pod-manifest-path=/etc/kubernetes/manifests \
-          --resolv-conf=/etc/resolv.conf \
-          --rotate-certificates=true \
           --kubeconfig=/etc/kubernetes/kubeconfig \
-          --bootstrap-kubeconfig=/etc/kubernetes/bootstrap.kubeconfig \
-          --lock-file=/var/run/lock/kubelet.lock \
-          --exit-on-lock-contention \
-          --read-only-port=0 \
-          --protect-kernel-defaults=true \
-          --authorization-mode=Webhook \
-          --anonymous-auth=false \
-          --client-ca-file=/etc/kubernetes/ca.crt
+          --bootstrap-kubeconfig=/etc/kubernetes/bootstrap.kubeconfig
         ExecStop=-/usr/bin/rkt stop --uuid-file=/var/cache/kubelet-pod.uuid
         Restart=always
         RestartSec=10
@@ -297,21 +311,12 @@ storage:
         inline: |
 {{ .CloudConfig | indent 10 }}
 
-    - path: /etc/kubernetes/ca.crt
+    - path: /etc/kubernetes/pki/ca.crt
       filesystem: root
       mode: 0644
       contents:
         inline: |
 {{ .KubernetesCACert | indent 10 }}
-
-{{- if semverCompare "<=1.11.*" .KubeletVersion }}
-    - path: /etc/coreos/docker-1.12
-      mode: 0644
-      filesystem: root
-      contents:
-        inline: |
-          yes
-{{ end }}
 
     - path: /etc/hostname
       filesystem: root
@@ -337,4 +342,32 @@ storage:
           PrintMotd no # handled by PAM
           PasswordAuthentication no
           ChallengeResponseAuthentication no
+
+    - path: /opt/bin/download_binaries
+      filesystem: root
+      mode: 0755
+      contents:
+        inline: |
+{{ downloadBinariesScript .KubeletVersion | indent 10 }}
+
+    - path: /etc/containerd/config.toml
+      filesystem: root
+      mode: 0644
+      contents:
+        inline: |
+{{ containerdConfig .KubeletVersion | indent 10 }}
+
+    - path: /etc/crictl.yaml
+      filesystem: root
+      mode: 0644
+      contents:
+        inline: |
+          runtime-endpoint: unix:///run/containerd/containerd.sock
+
+    - path: /etc/kubernetes/config.yaml
+      filesystem: root
+      mode: 0644
+      contents:
+        inline: |
+{{ kubeletConfig .ClusterDNSIPs "/etc/resolv.conf" | indent 10 }}
 `

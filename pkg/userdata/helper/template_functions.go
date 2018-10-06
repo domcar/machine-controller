@@ -1,4 +1,4 @@
-package template
+package helper
 
 import (
 	"fmt"
@@ -23,6 +23,11 @@ func TxtFuncMap() template.FuncMap {
 	funcMap := sprig.TxtFuncMap()
 
 	funcMap["ipSliceToCommaSeparatedString"] = ipSliceToCommaSeparatedString
+	funcMap["downloadBinariesScript"] = DownloadBinariesScript
+	funcMap["containerdConfig"] = ContainerdConfig
+	funcMap["containerdSystemdUnit"] = ContainerdSystemdUnit
+	funcMap["kubeletSystemdUnit"] = KubeletSystemdUnit
+	funcMap["kubeletConfig"] = KubeletConfig
 
 	return funcMap
 }

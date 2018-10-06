@@ -13,7 +13,6 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/kubermatic/machine-controller/pkg/providerconfig"
-	machinetemplate "github.com/kubermatic/machine-controller/pkg/template"
 	"github.com/kubermatic/machine-controller/pkg/userdata/cloud"
 	userdatahelper "github.com/kubermatic/machine-controller/pkg/userdata/helper"
 
@@ -47,7 +46,7 @@ func (p Provider) UserData(
 	clusterDNSIPs []net.IP,
 ) (string, error) {
 
-	tmpl, err := template.New("user-data").Funcs(machinetemplate.TxtFuncMap()).Parse(ctTemplate)
+	tmpl, err := template.New("user-data").Funcs(userdatahelper.TxtFuncMap()).Parse(ctTemplate)
 	if err != nil {
 		return "", fmt.Errorf("failed to parse user-data template: %v", err)
 	}
@@ -80,45 +79,45 @@ func (p Provider) UserData(
 		return "", fmt.Errorf("failed to parse OperatingSystemSpec: '%v'", err)
 	}
 
-	bootstrapToken, err := userdatahelper.GetTokenFromKubeconfig(kubeconfig)
-	if err != nil {
-		return "", fmt.Errorf("error extracting token: %v", err)
-	}
-
-	kubeadmCACertHash, err := userdatahelper.GetKubeadmCACertHash(kubeconfig)
-	if err != nil {
-		return "", fmt.Errorf("error extracting kubeadm cacert hash: %v", err)
-	}
-
 	serverAddr, err := userdatahelper.GetServerAddressFromKubeconfig(kubeconfig)
 	if err != nil {
 		return "", fmt.Errorf("error extracting server address from kubeconfig: %v", err)
 	}
 
+	kubeconfigString, err := userdatahelper.StringifyKubeconfig(kubeconfig)
+	if err != nil {
+		return "", err
+	}
+
+	kubernetesCACert, err := userdatahelper.GetCACert(kubeconfig)
+	if err != nil {
+		return "", fmt.Errorf("error extracting cacert: %v", err)
+	}
+
 	data := struct {
-		MachineSpec       clusterv1alpha1.MachineSpec
-		ProviderConfig    *providerconfig.Config
-		OSConfig          *Config
-		BoostrapToken     string
-		CloudProvider     string
-		CloudConfig       string
-		KubeletVersion    string
-		ClusterDNSIPs     []net.IP
-		KubeadmCACertHash string
-		ServerAddr        string
-		JournaldMaxSize   string
+		MachineSpec      clusterv1alpha1.MachineSpec
+		ProviderConfig   *providerconfig.Config
+		OSConfig         *Config
+		CloudProvider    string
+		CloudConfig      string
+		KubeletVersion   string
+		ClusterDNSIPs    []net.IP
+		ServerAddr       string
+		JournaldMaxSize  string
+		Kubeconfig       string
+		KubernetesCACert string
 	}{
-		MachineSpec:       spec,
-		ProviderConfig:    pconfig,
-		OSConfig:          osConfig,
-		BoostrapToken:     bootstrapToken,
-		CloudProvider:     cpName,
-		CloudConfig:       cpConfig,
-		KubeletVersion:    kubeletVersion.String(),
-		ClusterDNSIPs:     clusterDNSIPs,
-		KubeadmCACertHash: kubeadmCACertHash,
-		ServerAddr:        serverAddr,
-		JournaldMaxSize:   userdatahelper.JournaldMaxUse,
+		MachineSpec:      spec,
+		ProviderConfig:   pconfig,
+		OSConfig:         osConfig,
+		CloudProvider:    cpName,
+		CloudConfig:      cpConfig,
+		KubeletVersion:   kubeletVersion.String(),
+		ClusterDNSIPs:    clusterDNSIPs,
+		ServerAddr:       serverAddr,
+		JournaldMaxSize:  userdatahelper.JournaldMaxUse,
+		Kubeconfig:       kubeconfigString,
+		KubernetesCACert: kubernetesCACert,
 	}
 	b := &bytes.Buffer{}
 	err = tmpl.Execute(b, data)
@@ -158,16 +157,7 @@ write_files:
     kernel.panic_on_oops = 1
     kernel.panic = 10
     vm.overcommit_memory = 1
-
-- path: "/etc/yum.repos.d/kubernetes.repo"
-  content: |
-    [kubernetes]
-    name=Kubernetes
-    baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-$basearch
-    enabled=1
-    gpgcheck=1
-    repo_gpgcheck=1
-    gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+    net.ipv4.ip_forward = 1
 
 - path: /etc/sysconfig/selinux
   content: |
@@ -183,63 +173,30 @@ write_files:
     #     mls - Multi Level Security protection.
     SELINUXTYPE=targeted
 
-- path: "/etc/sysconfig/kubelet-overwrite"
-  content: |
-    KUBELET_DNS_ARGS=
-    KUBELET_EXTRA_ARGS=--authentication-token-webhook=true \
-      {{- if .CloudProvider }}
-      --cloud-provider={{ .CloudProvider }} \
-      --cloud-config=/etc/kubernetes/cloud-config \
-      {{- end}}
-      --hostname-override={{ .MachineSpec.Name }} \
-      --read-only-port=0 \
-      --protect-kernel-defaults=true \
-      --cluster-dns={{ ipSliceToCommaSeparatedString .ClusterDNSIPs }} \
-      --cluster-domain=cluster.local
-
-{{- if semverCompare "<1.11.0" .KubeletVersion }}
-- path: "/etc/systemd/system/kubelet.service.d/20-extra.conf"
-  content: |
-    [Service]
-    EnvironmentFile=/etc/sysconfig/kubelet
-{{- end }}
-
-- path: "/etc/kubernetes/cloud-config"
-  content: |
-{{ if ne .CloudConfig "" }}{{ .CloudConfig | indent 4 }}{{ end }}
-
-- path: "/usr/local/bin/setup"
+- path: "/opt/bin/setup"
   permissions: "0777"
   content: |
     #!/bin/bash
     set -xeuo pipefail
+
     setenforce 0 || true
     sysctl --system
 
-    yum install -y docker-1.13.1 \
-      kubelet-{{ .KubeletVersion }} \
-      kubeadm-{{ .KubeletVersion }} \
-      ebtables \
+    yum install -y ebtables \
       ethtool \
       nfs-utils \
       bash-completion \
-      sudo
+      sudo \
+      wget
 
-    cp /etc/sysconfig/kubelet-overwrite /etc/sysconfig/kubelet
+    # Download all required binaries
+    /opt/bin/download_binaries
 
-    systemctl enable --now docker
+    systemctl enable --now containerd
     systemctl enable --now kubelet
 
-    kubeadm join \
-      --token {{ .BoostrapToken }} \
-      --discovery-token-ca-cert-hash sha256:{{ .KubeadmCACertHash }} \
-      {{- if semverCompare ">=1.9.X" .KubeletVersion }}
-      --ignore-preflight-errors=CRI \
-      {{- end }}
-      {{ .ServerAddr }}
-
-- path: "/usr/local/bin/supervise.sh"
-  permissions: "0777"
+- path: "/opt/bin/supervise.sh"
+  permissions: "0755"
   content: |
     #!/bin/bash
     set -xeuo pipefail
@@ -247,7 +204,45 @@ write_files:
       sleep 1
     done
 
+- path: "/opt/bin/download_binaries"
+  permissions: "0755"
+  content: |
+{{ downloadBinariesScript .KubeletVersion | indent 4 }}
+
+- path: "/etc/systemd/system/kubelet.service"
+  content: |
+{{ kubeletSystemdUnit .KubeletVersion .CloudProvider .MachineSpec.Name | indent 4 }}
+
+{{ if ne .CloudConfig "" }}
+- path: "/etc/kubernetes/cloud-config"
+  content: |
+{{ .CloudConfig | indent 4 }}
+{{- end }}
+
+- path: "/etc/kubernetes/bootstrap.kubeconfig"
+  content: |
+{{ .Kubeconfig | indent 4 }}
+
+- path: "/etc/kubernetes/pki/ca.crt"
+  content: |
+{{ .KubernetesCACert | indent 4 }}
+
+- path: "/etc/containerd/config.toml"
+  permissions: "0644"
+  content: |
+{{ containerdConfig .KubeletVersion | indent 4 }}
+
+- path: "/etc/systemd/system/containerd.service"
+  permissions: "0644"
+  content: |
+{{ containerdSystemdUnit .KubeletVersion | indent 4 }}
+
+- path: "/var/lib/kubelet/config.yaml"
+  content: |
+{{ kubeletConfig .ClusterDNSIPs "/etc/resolv.conf" | indent 4 }}
+
 - path: "/etc/systemd/system/setup.service"
+  permissions: "0644"
   content: |
     [Install]
     WantedBy=multi-user.target
@@ -259,7 +254,17 @@ write_files:
     [Service]
     Type=oneshot
     RemainAfterExit=true
-    ExecStart=/usr/local/bin/supervise.sh /usr/local/bin/setup
+    ExecStart=/opt/bin/supervise.sh /opt/bin/setup
+
+- path: "/etc/crictl.yaml"
+  permissions: "0644"
+  content: |
+    runtime-endpoint: unix:///run/containerd/containerd.sock
+
+- path: "/etc/profile.d/opt-bin-path.sh"
+  permissions: "0755"
+  content: |
+    export PATH="/opt/bin:$PATH"
 
 runcmd:
 - systemctl enable --now setup.service
